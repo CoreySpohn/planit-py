@@ -3,7 +3,7 @@ requires = ['hatchling', "hatch-fancy-pypi-readme", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
-name = "planit"
+name = "planit-py"
 authors = [{ name = "Corey Spohn", email = "corey.a.spohn@nasa.gov" }]
 description = "A Python library to plan exoplanet observations."
 dependencies = ["astropy", "or-tools"]
@@ -18,14 +18,14 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/CoreySpohn/planit"
-Issues = "https://github.com/CoreySpohn/planit/issues"
+Homepage = "https://github.com/CoreySpohn/planit-py"
+Issues = "https://github.com/CoreySpohn/planit-py/issues"
 
 [tool.hatch.version]
 source = "vcs"
 
 [tool.hatch.build.hooks.vcs]
-version-file = "src/planit/_version.py"
+version-file = "src/planit-py/_version.py"
 
 [tool.hatch.metadata.hooks.fancy-pypi-readme]
 content-type = "text/markdown"
