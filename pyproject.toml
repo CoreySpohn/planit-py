@@ -6,10 +6,10 @@ build-backend = "hatchling.build"
 name = "planit-py"
 authors = [{ name = "Corey Spohn", email = "corey.a.spohn@nasa.gov" }]
 description = "A Python library to plan exoplanet observations."
-dependencies = ["astropy", "or-tools"]
+dependencies = ["equinox", "jax", "jaxlib"]
 license = { file = "LICENSE" }
 dynamic = ['readme', 'version']
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 classifiers = [
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: MIT License",
