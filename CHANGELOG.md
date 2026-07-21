@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.0](https://github.com/CoreySpohn/planit-py/compare/v0.0.1...v0.1.0) (2026-07-21)
+
+
+### Features
+
+* **vocabulary:** decision vocabulary as equinox modules ([2aad415](https://github.com/CoreySpohn/planit-py/commit/2aad415f3519888e6f8785afb47bb0971f2231d7))
+
 ## 0.0.1 (2025-08-04)
 
 
