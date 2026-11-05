@@ -161,3 +161,7 @@ cython_debug/
 
 # hatch-vcs
 *_version.py
+.claude/
+.jax_cache/
+.DS_Store
+.ruff_cache/
