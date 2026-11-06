@@ -8,6 +8,7 @@ from planit_py.vocabulary import (
     FixedDuration,
     Mode,
     ObservingContext,
+    PlanTable,
     StopOnCertificate,
     StopOnInformationRate,
 )
@@ -20,6 +21,7 @@ __all__ = [
     "FixedDuration",
     "Mode",
     "ObservingContext",
+    "PlanTable",
     "StopOnCertificate",
     "StopOnInformationRate",
 ]
