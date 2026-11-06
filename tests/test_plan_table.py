@@ -1,6 +1,7 @@
 """Tests for plan tables and the plan-row fields of Action."""
 
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 import pytest
 
@@ -65,10 +66,9 @@ class TestActionFields:
 def test_protocol_versions():
     """The cost-model protocol is at 2 and the policy protocol stays at 1.
 
-    Fails if a version moved without its contract changing, or a contract
-    change shipped without its version: cost models consume the new action
-    fields, while policies only produce actions whose defaults keep their
-    meaning.
+    Fails if either constant drifts from the release that added the plan-row
+    action fields: cost models must honor those fields when pricing, while
+    the calling contract of a policy did not change.
     """
     assert AbstractCostModel.PROTOCOL_VERSION == 2
     assert AbstractPolicy.PROTOCOL_VERSION == 1
@@ -120,6 +120,7 @@ class TestPlanTableConstruction:
             [0, 2],
             [0.0, 90],
             [[IMAGING], [IFS, IMAGING]],
+            channel_ids=[IMAGING, IFS],
             asset_ids=[0, 1],
             group_ids=[-1, 3],
             transition_kinds=[0, 1],
@@ -128,6 +129,21 @@ class TestPlanTableConstruction:
         assert eqx.tree_equal(direct, built)
         assert built.start_times_d.dtype == jnp.float64
         assert int(built.n_rows) == 2
+        empty = PlanTable.from_lists([], [], [], channel_ids=[IMAGING], capacity=2)
+        assert int(empty.n_rows) == 0
+
+    def test_refuses_float32_days_when_64_bit_mode_is_off(self):
+        """With 64-bit mode off, construction fails and names the fix.
+
+        Fails if a table silently stores float32 start epochs, which cannot
+        resolve seconds late in a mission, when the caller passed float64.
+        """
+        jax.config.update("jax_enable_x64", False)
+        try:
+            with pytest.raises(TypeError, match="64-bit mode is off"):
+                PlanTable.from_lists([0], [270.0], [[IMAGING]], channel_ids=[IMAGING])
+        finally:
+            jax.config.update("jax_enable_x64", True)
 
     @pytest.mark.parametrize(
         ("overrides", "error"),
@@ -162,7 +178,6 @@ class TestPlanTableConstruction:
                 "at least one channel",
             ),
             ({"target_ids": [0, 2, 5]}, "fill values"),
-            ({"asset_ids": [-1, 1, 0]}, "asset_ids must be non-negative"),
             ({"channel_ids": [IFS, IFS]}, "distinct"),
         ],
         ids=[
@@ -170,16 +185,42 @@ class TestPlanTableConstruction:
             "start-decreasing",
             "row-without-channel",
             "padding-not-filled",
-            "negative-asset",
             "duplicate-channel",
         ],
     )
-    def test_refuses_bad_rows(self, overrides, rule):
-        """Row values that break the plan semantics are refused by their rule.
+    def test_refuses_broken_plan_structure(self, overrides, rule):
+        """Rows that break the plan's ordering or set semantics are refused.
 
         Fails if a table can interleave padding with observations, run
         backwards in time, schedule a row that produces nothing, hide data in
         padding (so equal plans compare unequal), or repeat a channel column.
+        """
+        with pytest.raises(ValueError, match=rule):
+            PlanTable(**table_fields(**overrides))
+
+    @pytest.mark.parametrize(
+        ("overrides", "rule"),
+        [
+            ({"asset_ids": [-1, 1, 0]}, "asset_ids must be non-negative"),
+            ({"group_ids": [-2, 3, -1]}, "group_ids must be -1 or"),
+            ({"start_times_d": [-1.0, 90.0, 0.0]}, "start_times_d must be non-neg"),
+            ({"start_times_d": [0.0, jnp.inf, 0.0]}, "finite"),
+            ({"channel_ids": [-1, IFS]}, "channel_ids must be non-negative"),
+        ],
+        ids=[
+            "negative-asset",
+            "group-below-minus-one",
+            "negative-start",
+            "infinite-start",
+            "negative-channel",
+        ],
+    )
+    def test_refuses_out_of_range_values(self, overrides, rule):
+        """Identifiers and start epochs outside their ranges are refused.
+
+        Fails if a valid row can name a negative asset or channel, an
+        undefined group, or a start before mission time zero or at infinity,
+        any of which an executor would turn into a bad index or clock tick.
         """
         with pytest.raises(ValueError, match=rule):
             PlanTable(**table_fields(**overrides))
@@ -190,15 +231,23 @@ class TestPlanTableConstruction:
             (([0, 1], [0.0], [[IMAGING], [IMAGING]]), {}),
             (([0], [0.0], [[IFS]]), {"channel_ids": [IMAGING]}),
             (([0, 1], [0.0, 1.0], [[IMAGING], [IMAGING]]), {"capacity": 1}),
+            (([], [], []), {"channel_ids": [], "capacity": 2}),
         ],
-        ids=["length-mismatch", "undeclared-channel", "capacity-too-small"],
+        ids=[
+            "length-mismatch",
+            "undeclared-channel",
+            "capacity-too-small",
+            "no-channels",
+        ],
     )
     def test_from_lists_refusals(self, args, kwargs):
         """from_lists refuses inputs it cannot place in a table.
 
         Fails if ragged lists are truncated, an undeclared channel is dropped,
-        or rows beyond the capacity are silently cut.
+        rows beyond the capacity are silently cut, or a campaign declares no
+        channels.
         """
+        kwargs = {"channel_ids": [IMAGING, IFS], **kwargs}
         with pytest.raises(ValueError):
             PlanTable.from_lists(*args, **kwargs)
 
@@ -226,11 +275,12 @@ class TestPlanTableConstruction:
                     transition_kind=1,
                 ),
             ],
+            channel_ids=[IMAGING, IFS],
             capacity=3,
         )
         assert eqx.tree_equal(table, PlanTable(**table_fields()))
-        with pytest.raises(ValueError):
-            PlanTable.from_actions([action(0, 0.0)])
+        with pytest.raises(ValueError, match="no channel_ids"):
+            PlanTable.from_actions([action(0, 0.0)], channel_ids=[IMAGING])
 
 
 @pytest.fixture(scope="module")
@@ -270,9 +320,10 @@ class TestPlanSequences:
         assert not eqx.tree_equal(tables["myopic"], tables["lookahead"])
 
     def test_plans_share_one_compiled_program(self, tables):
-        """Two plans of one capacity run through one compiled function.
+        """Plans of one capacity and channel declaration share one program.
 
-        Fails if plans with the same capacity differ in structure or shape,
+        Fails if plans with the same capacity and declared channels differ in
+        structure or shape, including a plan that uses fewer of the channels,
         which would force an executor to recompile for every plan.
         """
         traces = []
@@ -284,4 +335,12 @@ class TestPlanSequences:
 
         assert int(spectroscopy_visits(tables["myopic"])) == 1
         assert int(spectroscopy_visits(tables["lookahead"])) == 2
+        imaging_only = PlanTable.from_lists(
+            [A, B],
+            SLOTS_D[:2],
+            [[IMAGING], [IMAGING]],
+            channel_ids=[IMAGING, IFS],
+            capacity=6,
+        )
+        assert int(spectroscopy_visits(imaging_only)) == 0
         assert len(traces) == 1

@@ -142,16 +142,28 @@ class PlanTable(eqx.Module):
     plan table once; an executor reads it row by row, converting start
     epochs to its own clock, without running the planner again.
 
-    Every array has the fixed leading length ``capacity`` so that tables of
-    different plans with the same capacity share one shape. Valid rows come
-    first, in nondecreasing start order; the remaining padding rows hold the
-    fill values (ids 0, group -1, start 0.0, no channels), so two tables that
-    hold the same plan at the same capacity are equal leaf by leaf.
+    The shape of a table is set by ``capacity`` (rows) and ``n_channels``
+    (the declared channel columns), so plans built with the same capacity and
+    the same ``channel_ids`` share one shape and one compiled program. Valid
+    rows come first, in nondecreasing start order; rows with equal start
+    epochs keep their row order. The remaining padding rows hold the fill
+    values (ids 0, group -1, start 0.0, no channels), so two tables that hold
+    the same plan at the same capacity are equal leaf by leaf. A table with
+    no valid rows is an empty plan.
 
-    Start epochs must be float64, which needs JAX's 64-bit mode
-    (``jax_enable_x64``). An executor that converts days to a fine clock
-    needs that resolution: the float32 spacing at day 270 is about 2.6 s.
-    Build tables on the host; ``__check_init__`` reads concrete values.
+    Channel, asset and transition identifiers are the environment's own
+    declarations; the table stores them and does not interpret them. The
+    executor owns what each id means, including the exposure each channel
+    takes, and checks what a coordination group requires of its members
+    (for example a shared start or asset).
+
+    Start epochs are days of mission time, non-negative, and must be float64,
+    which needs JAX's 64-bit mode (``jax_enable_x64``) to be on in the
+    process that builds the table. An executor that converts days to a fine
+    clock needs that resolution: the float32 spacing at day 270 is about
+    2.6 s. Build tables on the host: ``__check_init__`` reads concrete values,
+    so construction under ``jit`` or ``vmap`` fails, and functional updates
+    such as ``eqx.tree_at`` skip the checks.
 
     Attributes:
         target_ids: Integer array, shape (capacity,); catalog identifier of
@@ -162,13 +174,13 @@ class PlanTable(eqx.Module):
         channel_ids: Integer array, shape (n_channels,); the distinct channel
             identifier of each column of ``channel_mask``.
         channel_mask: Boolean array, shape (capacity, n_channels); True where
-            the row produces that column's channel. A valid row produces at
-            least one channel.
+            the row produces that column's channel. A valid row produces a
+            non-empty set of channels.
         group_ids: Integer array, shape (capacity,); coordination group of
             each row. Rows sharing a non-negative group id are executed
             together or not at all; -1 means the row stands alone.
         start_times_d: Float64 array, shape (capacity,); requested start epoch
-            of each row in days of mission time.
+            of each row in days of mission time, non-negative.
         transition_kinds: Integer array, shape (capacity,); identifier of the
             transition model that moves the row's asset from its previous
             observation to this one; 0 is the asset's default transition.
@@ -230,9 +242,15 @@ class PlanTable(eqx.Module):
             if a.dtype != jnp.bool_:
                 raise TypeError(f"{name} must be boolean, got {a.dtype}")
         if self.start_times_d.dtype != jnp.float64:
+            if not jax.config.read("jax_enable_x64"):
+                raise TypeError(
+                    "JAX 64-bit mode is off, so start_times_d was stored as "
+                    f"{self.start_times_d.dtype}; enable it with "
+                    "jax.config.update('jax_enable_x64', True) before building "
+                    "a PlanTable"
+                )
             raise TypeError(
-                f"start_times_d must be float64, got {self.start_times_d.dtype}; "
-                "enable 64-bit mode with jax.config.update('jax_enable_x64', True)"
+                f"start_times_d must be float64, got {self.start_times_d.dtype}"
             )
 
         if bool(jnp.any(self.channel_ids < 0)):
@@ -253,6 +271,8 @@ class PlanTable(eqx.Module):
         start = self.start_times_d
         if bool(jnp.any(live & ~jnp.isfinite(start))):
             raise ValueError("start_times_d must be finite on valid rows")
+        if bool(jnp.any(live & (start < 0.0))):
+            raise ValueError("start_times_d must be non-negative on valid rows")
         if bool(jnp.any(live[1:] & (start[1:] < start[:-1]))):
             raise ValueError("start_times_d must be nondecreasing over the valid rows")
         if bool(jnp.any(live & ~jnp.any(self.channel_mask, axis=1))):
@@ -283,7 +303,7 @@ class PlanTable(eqx.Module):
         start_times_d,
         channel_sets,
         *,
-        channel_ids=None,
+        channel_ids,
         asset_ids=None,
         group_ids=None,
         transition_kinds=None,
@@ -295,9 +315,12 @@ class PlanTable(eqx.Module):
             target_ids: Catalog target identifier of each row.
             start_times_d: Start epoch of each row in days of mission time.
             channel_sets: For each row, an iterable of the channel ids it
-                produces.
-            channel_ids: Column order of ``channel_mask``. Defaults to the
-                sorted distinct channel ids named in ``channel_sets``.
+                produces; repeats within a row collapse, as in a set.
+            channel_ids: Every channel id the campaign declares, in the column
+                order of ``channel_mask``. Required, and fixed per campaign,
+                because it sets the table shape: plans that declare the same
+                channels share one compiled program whichever channels they
+                use.
             asset_ids: Asset index of each row; defaults to 0 for every row.
             group_ids: Coordination group of each row; defaults to -1 (each
                 row stands alone).
@@ -329,8 +352,6 @@ class PlanTable(eqx.Module):
                 raise ValueError(
                     f"{name} has {len(column)} entries; target_ids has {n}"
                 )
-        if channel_ids is None:
-            channel_ids = sorted({c for row in channel_sets for c in row})
         channel_ids = list(channel_ids)
         capacity = n if capacity is None else capacity
         if capacity < n:
@@ -361,16 +382,17 @@ class PlanTable(eqx.Module):
         )
 
     @classmethod
-    def from_actions(cls, actions, *, channel_ids=None, capacity=None) -> "PlanTable":
+    def from_actions(cls, actions, *, channel_ids, capacity=None) -> "PlanTable":
         """Build a plan table from actions in chronological order.
 
         Each row keeps its action's target, start epoch, asset, channels,
         group and transition kind. Mode, bands and the integration policy are
-        not part of a plan row: an executor resolves them from the channels.
+        not part of a plan row: the executor owns what each channel observes
+        and how long it integrates.
 
         Args:
             actions: The actions, in nondecreasing start order.
-            channel_ids: Column order of ``channel_mask``; see
+            channel_ids: Every channel id the campaign declares; see
                 :meth:`from_lists`.
             capacity: Number of rows in the table; see :meth:`from_lists`.
 
@@ -434,6 +456,10 @@ class AbstractCostModel(eqx.Module):
     Costs are dictionaries mapping resource names to amounts; ``"time_d"`` is
     the universal resource and is always present.
 
+    The protocol version names the action fields a cost model honors when
+    it prices an action. An environment that emits actions using a field
+    checks that the cost model's version covers it.
+
     Protocol versions:
         1: actions carry a target, mode, bands, integration policy and start
             epoch.
@@ -468,11 +494,16 @@ class AbstractPolicy(eqx.Module):
     whatever belief container the environment maintains; policies constrain it
     only through the operations they perform on it.
 
+    The protocol version names the calling contract of :meth:`propose`: its
+    arguments, its single returned action, and statelessness. Which action
+    fields a policy sets is the policy's own choice, not part of the
+    protocol: every action it returns is valid, and one that leaves a field
+    at its default means what that default means (for example, asset 0).
+
     Protocol versions:
-        1: ``propose(belief, ctx, cost_model)`` returns one action. The newer
-            keyword-only action fields did not change this contract: a policy
-            that never sets them returns actions with their defaults, whose
-            meaning is unchanged.
+        1: ``propose(belief, ctx, cost_model)`` returns one action. The
+            keyword-only action fields added beside cost-model version 2 left
+            this contract unchanged.
     """
 
     PROTOCOL_VERSION: ClassVar[int] = 1
