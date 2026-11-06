@@ -78,6 +78,12 @@ class StopOnInformationRate(AbstractIntegrationPolicy):
 class Action(eqx.Module):
     """One scheduled observation.
 
+    Grows by keyword-only field additions with defaults, so existing call
+    sites stay valid and an action that sets none of the newer fields means
+    what it meant before they existed. The newer fields carry the identity a
+    row of a fixed-shape plan carries, so an action and a plan row describe
+    the same observation.
+
     Attributes:
         target_id: Identifier of the target in the mission catalog.
         mode: Observing mode.
@@ -85,6 +91,25 @@ class Action(eqx.Module):
         integration: The integration policy; the environment reports the
             realized duration.
         start_time_d: Requested start epoch in days of mission time.
+        asset_id: Index of the observing asset (a telescope, instrument
+            platform or other facility) that executes the action. Needed once
+            a campaign has more than one asset; 0 is the environment's first or
+            only asset, so single-asset environments ignore it.
+        channel_ids: Identifiers of the measurement channels the action
+            produces, as declared by the environment. Needed because one
+            pointing can feed several channels at once, and an integer set
+            is what fixed-shape plan tables store. Empty (the default) means
+            the environment derives the channels from ``mode`` and ``bands``.
+        group_id: Coordination group. Actions sharing a non-negative group id
+            are executed together or not at all, which a coordinated
+            observation across channels or assets needs. -1 (the default)
+            means the action stands alone.
+        transition_kind: Identifier of the transition model that moves the
+            asset from its previous action to this one, for example an
+            ordinary slew versus a retarget that moves a separate vehicle.
+            Needed because the cost of a leg can depend on how it is flown,
+            not only on where it ends. 0 (the default) is the asset's default
+            transition.
     """
 
     target_id: int
@@ -92,6 +117,10 @@ class Action(eqx.Module):
     bands: tuple[str, ...]
     integration: AbstractIntegrationPolicy
     start_time_d: float
+    asset_id: int = eqx.field(default=0, kw_only=True)
+    channel_ids: tuple[int, ...] = eqx.field(default=(), kw_only=True)
+    group_id: int = eqx.field(default=-1, kw_only=True)
+    transition_kind: int = eqx.field(default=0, kw_only=True)
 
 
 @final
