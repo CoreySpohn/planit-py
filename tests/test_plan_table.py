@@ -3,6 +3,8 @@
 import pytest
 
 from planit_py.vocabulary import (
+    AbstractCostModel,
+    AbstractPolicy,
     Action,
     FixedDuration,
     Mode,
@@ -55,3 +57,15 @@ class TestActionFields:
         assert (action.group_id, action.transition_kind) == (4, 1)
         with pytest.raises(TypeError):
             Action(3, Mode.IMAGING, ("500nm",), FixedDuration(1.0), 0.0, 1)
+
+
+def test_protocol_versions():
+    """The cost-model protocol is at 2 and the policy protocol stays at 1.
+
+    Fails if a version moved without its contract changing, or a contract
+    change shipped without its version: cost models consume the new action
+    fields, while policies only produce actions whose defaults keep their
+    meaning.
+    """
+    assert AbstractCostModel.PROTOCOL_VERSION == 2
+    assert AbstractPolicy.PROTOCOL_VERSION == 1

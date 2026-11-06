@@ -157,9 +157,20 @@ class AbstractCostModel(eqx.Module):
 
     Costs are dictionaries mapping resource names to amounts; ``"time_d"`` is
     the universal resource and is always present.
+
+    Protocol versions:
+        1: actions carry a target, mode, bands, integration policy and start
+            epoch.
+        2: actions also carry ``asset_id``, ``channel_ids``, ``group_id`` and
+            ``transition_kind``, and a cost model prices them: the asset
+            decides which resources are charged, the channels what each
+            exposure charges, and the transition kind what the leg into the
+            action costs. A version 1 model ignores those fields and would
+            misprice an action that sets them, so an environment that emits
+            them requires version 2.
     """
 
-    PROTOCOL_VERSION: ClassVar[int] = 1
+    PROTOCOL_VERSION: ClassVar[int] = 2
 
     @abc.abstractmethod
     def expected(self, action: Action, ctx: ObservingContext) -> dict[str, float]:
@@ -180,6 +191,12 @@ class AbstractPolicy(eqx.Module):
     unchanged inside a simulator or against a real mission. ``belief`` is
     whatever belief container the environment maintains; policies constrain it
     only through the operations they perform on it.
+
+    Protocol versions:
+        1: ``propose(belief, ctx, cost_model)`` returns one action. The newer
+            keyword-only action fields did not change this contract: a policy
+            that never sets them returns actions with their defaults, whose
+            meaning is unchanged.
     """
 
     PROTOCOL_VERSION: ClassVar[int] = 1
