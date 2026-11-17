@@ -147,9 +147,9 @@ class PlanTable(eqx.Module):
     the same ``channel_ids`` share one shape and one compiled program. Valid
     rows come first, in nondecreasing start order; rows with equal start
     epochs keep their row order. The remaining padding rows hold the fill
-    values (ids 0, group -1, start 0.0, no channels), so two tables that hold
-    the same plan at the same capacity are equal leaf by leaf. A table with
-    no valid rows is an empty plan.
+    values (ids 0, group -1, start 0.0, duration 0.0, no channels), so two
+    tables that hold the same plan at the same capacity are equal leaf by
+    leaf. A table with no valid rows is an empty plan.
 
     Channel, asset and transition identifiers are the environment's own
     declarations; the table stores them and does not interpret them. The
@@ -184,6 +184,9 @@ class PlanTable(eqx.Module):
         transition_kinds: Integer array, shape (capacity,); identifier of the
             transition model that moves the row's asset from its previous
             observation to this one; 0 is the asset's default transition.
+        durations_d: Float64 array, shape (capacity,); fixed integration time
+            of each row in days, non-negative. A row always carries its
+            duration, so a replay needs nothing beyond the table.
         valid: Boolean array, shape (capacity,); True for the rows that hold
             observations. Valid rows form a prefix of the table.
     """
@@ -195,6 +198,7 @@ class PlanTable(eqx.Module):
     group_ids: jax.Array = eqx.field(converter=jnp.asarray)
     start_times_d: jax.Array = eqx.field(converter=_as_days)
     transition_kinds: jax.Array = eqx.field(converter=jnp.asarray)
+    durations_d: jax.Array = eqx.field(converter=_as_days)
     valid: jax.Array = eqx.field(converter=jnp.asarray)
 
     def __check_init__(self):
@@ -205,6 +209,7 @@ class PlanTable(eqx.Module):
             "group_ids": self.group_ids,
             "start_times_d": self.start_times_d,
             "transition_kinds": self.transition_kinds,
+            "durations_d": self.durations_d,
             "valid": self.valid,
         }
         capacity = self.valid.shape[0] if self.valid.ndim == 1 else 0
@@ -241,17 +246,17 @@ class PlanTable(eqx.Module):
         for name, a in (("channel_mask", self.channel_mask), ("valid", self.valid)):
             if a.dtype != jnp.bool_:
                 raise TypeError(f"{name} must be boolean, got {a.dtype}")
-        if self.start_times_d.dtype != jnp.float64:
-            if not jax.config.read("jax_enable_x64"):
-                raise TypeError(
-                    "JAX 64-bit mode is off, so start_times_d was stored as "
-                    f"{self.start_times_d.dtype}; enable it with "
-                    "jax.config.update('jax_enable_x64', True) before building "
-                    "a PlanTable"
-                )
-            raise TypeError(
-                f"start_times_d must be float64, got {self.start_times_d.dtype}"
-            )
+        for name in ("start_times_d", "durations_d"):
+            days = row_fields[name]
+            if days.dtype != jnp.float64:
+                if not jax.config.read("jax_enable_x64"):
+                    raise TypeError(
+                        f"JAX 64-bit mode is off, so {name} was stored as "
+                        f"{days.dtype}; enable it with "
+                        "jax.config.update('jax_enable_x64', True) before "
+                        "building a PlanTable"
+                    )
+                raise TypeError(f"{name} must be float64, got {days.dtype}")
 
         if bool(jnp.any(self.channel_ids < 0)):
             raise ValueError("channel_ids must be non-negative")
@@ -273,6 +278,11 @@ class PlanTable(eqx.Module):
             raise ValueError("start_times_d must be finite on valid rows")
         if bool(jnp.any(live & (start < 0.0))):
             raise ValueError("start_times_d must be non-negative on valid rows")
+        durations = self.durations_d
+        if bool(jnp.any(live & ~jnp.isfinite(durations))):
+            raise ValueError("durations_d must be finite on valid rows")
+        if bool(jnp.any(live & (durations < 0.0))):
+            raise ValueError("durations_d must be non-negative on valid rows")
         if bool(jnp.any(live[1:] & (start[1:] < start[:-1]))):
             raise ValueError("start_times_d must be nondecreasing over the valid rows")
         if bool(jnp.any(live & ~jnp.any(self.channel_mask, axis=1))):
@@ -282,6 +292,7 @@ class PlanTable(eqx.Module):
             | (self.asset_ids != 0)
             | (self.group_ids != -1)
             | (start != 0.0)
+            | (self.durations_d != 0.0)
             | (self.transition_kinds != 0)
             | jnp.any(self.channel_mask, axis=1)
         )
@@ -304,6 +315,7 @@ class PlanTable(eqx.Module):
         channel_sets,
         *,
         channel_ids,
+        durations_d,
         asset_ids=None,
         group_ids=None,
         transition_kinds=None,
@@ -321,6 +333,9 @@ class PlanTable(eqx.Module):
                 because it sets the table shape: plans that declare the same
                 channels share one compiled program whichever channels they
                 use.
+            durations_d: Fixed integration time of each row in days. Required:
+                a plan row is self-describing, so a replay needs no other
+                source for how long each row integrates.
             asset_ids: Asset index of each row; defaults to 0 for every row.
             group_ids: Coordination group of each row; defaults to -1 (each
                 row stands alone).
@@ -340,6 +355,7 @@ class PlanTable(eqx.Module):
         channel_sets = [tuple(row) for row in channel_sets]
         columns = {
             "start_times_d": list(start_times_d),
+            "durations_d": list(durations_d),
             "channel_sets": channel_sets,
             "asset_ids": [0] * n if asset_ids is None else list(asset_ids),
             "group_ids": [-1] * n if group_ids is None else list(group_ids),
@@ -378,6 +394,7 @@ class PlanTable(eqx.Module):
             group_ids=columns["group_ids"] + [-1] * pad,
             start_times_d=columns["start_times_d"] + [0.0] * pad,
             transition_kinds=columns["transition_kinds"] + [0] * pad,
+            durations_d=columns["durations_d"] + [0.0] * pad,
             valid=[True] * n + [False] * pad,
         )
 
@@ -386,9 +403,10 @@ class PlanTable(eqx.Module):
         """Build a plan table from actions in chronological order.
 
         Each row keeps its action's target, start epoch, asset, channels,
-        group and transition kind. Mode, bands and the integration policy are
-        not part of a plan row: the executor owns what each channel observes
-        and how long it integrates.
+        group, transition kind and fixed integration duration. Mode and bands
+        are not part of a plan row: the executor owns what each channel
+        observes. An adaptive integration policy has no duration until it
+        runs, so it must be resolved to a :class:`FixedDuration` first.
 
         Args:
             actions: The actions, in nondecreasing start order.
@@ -400,7 +418,8 @@ class PlanTable(eqx.Module):
             The plan table, validated.
 
         Raises:
-            ValueError: If an action declares no ``channel_ids``, or as
+            ValueError: If an action declares no ``channel_ids``, its
+                integration policy is not a :class:`FixedDuration`, or as
                 :meth:`from_lists` raises.
         """
         actions = list(actions)
@@ -409,11 +428,18 @@ class PlanTable(eqx.Module):
                 raise ValueError(
                     f"action {i} declares no channel_ids; a plan row needs its channels"
                 )
+            if not isinstance(action.integration, FixedDuration):
+                raise ValueError(
+                    f"action {i} has an adaptive integration policy "
+                    f"({type(action.integration).__name__}); an adaptive action "
+                    "must be resolved to a fixed duration before it is serialized"
+                )
         return cls.from_lists(
             [a.target_id for a in actions],
             [a.start_time_d for a in actions],
             [a.channel_ids for a in actions],
             channel_ids=channel_ids,
+            durations_d=[a.integration.duration_d for a in actions],
             asset_ids=[a.asset_id for a in actions],
             group_ids=[a.group_id for a in actions],
             transition_kinds=[a.transition_kind for a in actions],

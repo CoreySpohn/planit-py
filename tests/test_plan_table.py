@@ -12,6 +12,8 @@ from planit_py.vocabulary import (
     FixedDuration,
     Mode,
     PlanTable,
+    StopOnCertificate,
+    StopOnInformationRate,
 )
 
 
@@ -93,6 +95,7 @@ def table_fields(**overrides):
         "group_ids": [-1, 3, -1],
         "start_times_d": [0.0, 90.0, 0.0],
         "transition_kinds": [0, 1, 0],
+        "durations_d": [0.01, 0.01, 0.0],
         "valid": [True, True, False],
     }
     fields.update(overrides)
@@ -124,12 +127,15 @@ class TestPlanTableConstruction:
             asset_ids=[0, 1],
             group_ids=[-1, 3],
             transition_kinds=[0, 1],
+            durations_d=[0.01, 0.01],
             capacity=3,
         )
         assert eqx.tree_equal(direct, built)
         assert built.start_times_d.dtype == jnp.float64
         assert int(built.n_rows) == 2
-        empty = PlanTable.from_lists([], [], [], channel_ids=[IMAGING], capacity=2)
+        empty = PlanTable.from_lists(
+            [], [], [], channel_ids=[IMAGING], durations_d=[], capacity=2
+        )
         assert int(empty.n_rows) == 0
 
     def test_refuses_float32_days_when_64_bit_mode_is_off(self):
@@ -141,7 +147,13 @@ class TestPlanTableConstruction:
         jax.config.update("jax_enable_x64", False)
         try:
             with pytest.raises(TypeError, match="64-bit mode is off"):
-                PlanTable.from_lists([0], [270.0], [[IMAGING]], channel_ids=[IMAGING])
+                PlanTable.from_lists(
+                    [0],
+                    [270.0],
+                    [[IMAGING]],
+                    channel_ids=[IMAGING],
+                    durations_d=[0.01],
+                )
         finally:
             jax.config.update("jax_enable_x64", True)
 
@@ -206,6 +218,8 @@ class TestPlanTableConstruction:
             ({"start_times_d": [-1.0, 90.0, 0.0]}, "start_times_d must be non-neg"),
             ({"start_times_d": [0.0, jnp.inf, 0.0]}, "finite"),
             ({"channel_ids": [-1, IFS]}, "channel_ids must be non-negative"),
+            ({"durations_d": [-0.5, 0.01, 0.0]}, "durations_d must be non-neg"),
+            ({"durations_d": [0.01, jnp.inf, 0.0]}, "durations_d must be finite"),
         ],
         ids=[
             "negative-asset",
@@ -213,6 +227,8 @@ class TestPlanTableConstruction:
             "negative-start",
             "infinite-start",
             "negative-channel",
+            "negative-duration",
+            "infinite-duration",
         ],
     )
     def test_refuses_out_of_range_values(self, overrides, rule):
@@ -231,7 +247,7 @@ class TestPlanTableConstruction:
             (([0, 1], [0.0], [[IMAGING], [IMAGING]]), {}),
             (([0], [0.0], [[IFS]]), {"channel_ids": [IMAGING]}),
             (([0, 1], [0.0, 1.0], [[IMAGING], [IMAGING]]), {"capacity": 1}),
-            (([], [], []), {"channel_ids": [], "capacity": 2}),
+            (([], [], []), {"channel_ids": [], "durations_d": [], "capacity": 2}),
         ],
         ids=[
             "length-mismatch",
@@ -247,7 +263,7 @@ class TestPlanTableConstruction:
         rows beyond the capacity are silently cut, or a campaign declares no
         channels.
         """
-        kwargs = {"channel_ids": [IMAGING, IFS], **kwargs}
+        kwargs = {"channel_ids": [IMAGING, IFS], "durations_d": [0.01, 0.01], **kwargs}
         with pytest.raises(ValueError):
             PlanTable.from_lists(*args, **kwargs)
 
@@ -282,13 +298,60 @@ class TestPlanTableConstruction:
         with pytest.raises(ValueError, match="no channel_ids"):
             PlanTable.from_actions([action(0, 0.0)], channel_ids=[IMAGING])
 
+    def test_from_actions_distinguishes_durations(self):
+        """Actions that differ only in fixed duration give different rows.
+
+        Fails if from_actions drops the integration policy, so a replay cannot
+        tell a short exposure from a long one.
+        """
+
+        def table(duration_d):
+            action = Action(
+                0,
+                Mode.IMAGING,
+                ("500nm",),
+                FixedDuration(duration_d),
+                0.0,
+                channel_ids=(IMAGING,),
+            )
+            return PlanTable.from_actions([action], channel_ids=[IMAGING])
+
+        short, long = table(0.5), table(2.0)
+        assert not eqx.tree_equal(short, long)
+        assert float(long.durations_d[0]) == 2.0
+
+    @pytest.mark.parametrize(
+        "policy",
+        [
+            StopOnCertificate(threshold=5.0, max_duration_d=3.0),
+            StopOnInformationRate(floor_nats_per_d=0.1, max_duration_d=3.0),
+        ],
+        ids=["certificate", "information-rate"],
+    )
+    def test_from_actions_refuses_adaptive_policy(self, policy):
+        """An adaptive action is refused until it is resolved to a duration.
+
+        Fails if from_actions serializes an action whose integration time is
+        not yet known, which would write a row that replays differently.
+        """
+        action = Action(
+            0, Mode.IMAGING, ("500nm",), policy, 0.0, channel_ids=(IMAGING,)
+        )
+        with pytest.raises(ValueError, match="resolved to a fixed duration"):
+            PlanTable.from_actions([action], channel_ids=[IMAGING])
+
 
 @pytest.fixture(scope="module")
 def tables():
     """Both plans of the four-slot campaign, at a capacity of six rows."""
     return {
         name: PlanTable.from_lists(
-            targets, SLOTS_D, chans, channel_ids=[IMAGING, IFS], capacity=6
+            targets,
+            SLOTS_D,
+            chans,
+            channel_ids=[IMAGING, IFS],
+            durations_d=[0.01] * 4,
+            capacity=6,
         )
         for name, (targets, chans) in PLANS.items()
     }
@@ -340,6 +403,7 @@ class TestPlanSequences:
             SLOTS_D[:2],
             [[IMAGING], [IMAGING]],
             channel_ids=[IMAGING, IFS],
+            durations_d=[0.01, 0.01],
             capacity=6,
         )
         assert int(spectroscopy_visits(imaging_only)) == 0
