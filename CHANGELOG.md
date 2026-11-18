@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.0](https://github.com/CoreySpohn/planit-py/compare/v0.2.0...v0.3.0) (2026-11-18)
+
+
+### ⚠ BREAKING CHANGES
+
+* carry fixed durations in plan tables and refuse unresolved adaptive actions
+
+### Features
+
+* carry fixed durations in plan tables and refuse unresolved adaptive actions ([fc47d23](https://github.com/CoreySpohn/planit-py/commit/fc47d23fde84a21327a4348a8c93a1525ea6daf0))
+
 ## [0.2.0](https://github.com/CoreySpohn/planit-py/compare/v0.1.0...v0.2.0) (2026-11-06)
 
 
